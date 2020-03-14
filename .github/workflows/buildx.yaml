@@ -1,26 +1,73 @@
-name: Docker buildx
+name: Docker
 on: [push]
 jobs:
   build:
     runs-on: ubuntu-18.04
     steps:
-    - uses: actions/checkout@v2
-    - name: Login to DockerHub Registry
-      run: echo ${{ secrets.DOCKERHUB_PASSWORD }} | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
-    - name: Get the version
-      id: vars
-      run: echo ::set-output name=tag::$(echo ${GITHUB_REF:10})
+    - name: Prepare
+      id: prepare
+      run: |
+        if [[ $GITHUB_REF == refs/tags/* ]]; then
+          echo ::set-output name=version::${GITHUB_REF#refs/tags/v}
+        elif [[ $GITHUB_REF == refs/heads/master ]]; then
+          echo ::set-output name=version::latest
+        elif [[ $GITHUB_REF == refs/heads/* ]]; then
+          echo ::set-output name=version::${GITHUB_REF#refs/heads/v}
+        else
+          echo ::set-output name=version::snapshot
+        fi
+
+        echo ::set-output name=build_date::$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+        echo ::set-output name=docker_platforms::linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/386,linux/ppc64le,linux/s390x
+        echo ::set-output name=docker_username::${{ secrets.DOCKER_USERNAME }}
+        echo ::set-output name=docker_image::${{ secrets.DOCKER_USERNAME }}/${{ github.event.repository.name }}
+
+      # https://github.com/crazy-max/ghaction-docker-buildx
     - name: Set up Docker Buildx
       id: buildx
       uses: crazy-max/ghaction-docker-buildx@v1
       with:
         version: latest
+
     - name: Available platforms
       run: echo ${{ steps.buildx.outputs.platforms }}
 
-    - name: Run Buildx
+      # https://github.com/actions/checkout
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Docker Buildx (no push)
       run: |
         docker buildx build \
-            -t ginuerzh/docker-buildx-multiarch:${{steps.vars.outputs.tag}} \
-            --platform linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x \
-            . --push
+          --platform ${{ steps.prepare.outputs.docker_platforms }} \
+          --output "type=image,push=false" \
+          --build-arg "VERSION=${{ steps.prepare.outputs.version }}" \
+          --build-arg "BUILD_DATE=${{ steps.prepare.outputs.build_date }}" \
+          --build-arg "VCS_REF=${GITHUB_SHA::8}" \
+          --tag "${{ steps.prepare.outputs.docker_image }}:${{ steps.prepare.outputs.version }}" \
+          --file Dockerfile .
+
+    - name: Docker Login
+      if: success()
+      env:
+        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      run: |
+        echo "${DOCKER_PASSWORD}" | docker login --username "${{ steps.prepare.outputs.docker_username }}" --password-stdin
+
+    - name: Docker Buildx (push)
+      if: success()
+      run: |
+        docker buildx build \
+          --platform ${{ steps.prepare.outputs.docker_platforms }} \
+          --output "type=image,push=true" \
+          --build-arg "VERSION=${{ steps.prepare.outputs.version }}" \
+          --build-arg "BUILD_DATE=${{ steps.prepare.outputs.build_date }}" \
+          --build-arg "VCS_REF=${GITHUB_SHA::8}" \
+          --tag "${{ steps.prepare.outputs.docker_image }}:${{ steps.prepare.outputs.version }}" \
+          --file Dockerfile .
+
+    - name: Clear
+      if: always()
+      run: |
+        rm -f ${HOME}/.docker/config.json
+
